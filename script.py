@@ -26,6 +26,49 @@ class K8sResourceManager:
         self.cache_expiry = 300
         self.config = self.load_config()
 
+    def save_config(self) -> None:
+        """Save current configuration to JSON file"""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=2)
+            logger.info("Configuration saved successfully")
+        except Exception as e:
+            logger.error(f"Error saving config file: {str(e)}")
+
+    def update_config_for_pod(self, namespace: str, pod_name: str) -> None:
+        """Update configuration with new namespace and pod if not present"""
+        config_modified = False
+
+        # Add namespace if it doesn't exist and isn't excluded
+        if (namespace not in self.config.get("namespaces", {}) and 
+            namespace not in self.config.get("excluded_namespaces", [])):
+            if "namespaces" not in self.config:
+                self.config["namespaces"] = {}
+            self.config["namespaces"][namespace] = {
+                "termination_window": self.config.get("default_termination_window", "2h"),
+                "pods": {}
+            }
+            logger.info(f"Added new namespace to config: {namespace}")
+            config_modified = True
+
+        # Add pod if it doesn't exist in the namespace
+        if namespace in self.config.get("namespaces", {}):
+            namespace_config = self.config["namespaces"][namespace]
+            if "pods" not in namespace_config:
+                namespace_config["pods"] = {}
+            
+            if pod_name not in namespace_config["pods"]:
+                namespace_config["pods"][pod_name] = {
+                    "termination_window": namespace_config.get("termination_window", 
+                                        self.config.get("default_termination_window", "2h"))
+                }
+                logger.info(f"Added new pod to config: {namespace}/{pod_name}")
+                config_modified = True
+
+        # Save config if modified
+        if config_modified:
+            self.save_config()
+
     def load_config(self) -> dict:
         """Load configuration from JSON file with error handling"""
         default_config = {
@@ -33,7 +76,7 @@ class K8sResourceManager:
             "default_termination_window": "2h",
             "namespaces": {}
         }
-        
+
         try:
             if not os.path.exists(self.config_file):
                 with open(self.config_file, 'w') as f:
@@ -50,7 +93,7 @@ class K8sResourceManager:
                     logger.error(f"Invalid JSON in config file: {str(e)}")
                     logger.info("Using default configuration")
                     return default_config
-                
+
         except Exception as e:
             logger.error(f"Error handling config file: {str(e)}")
             logger.info("Using default configuration")
@@ -65,7 +108,7 @@ class K8sResourceManager:
                 text=True,
                 timeout=30
             )
-            
+
             if process.returncode == 0:
                 return process.stdout
             logger.error(f"Command failed: {process.stderr}")
@@ -77,7 +120,7 @@ class K8sResourceManager:
     def parse_gpushare_output(self) -> List[dict]:
         """Parse kubectl inspect gpushare output"""
         logger.info("Fetching GPU allocations...")
-        
+
         output = self.execute_command(['kubectl', 'inspect', 'gpushare', '-d'])
         if not output:
             return []
@@ -85,38 +128,41 @@ class K8sResourceManager:
         pods = []
         current_node = None
         reading_pod_section = False
-        
+
         for line in output.strip().split('\n'):
             line = line.strip()
-            
+
             if not line or line.startswith('---'):
                 continue
-                
+
             if line.startswith('NAME:'):
                 current_node = line.split()[1].strip()
                 reading_pod_section = False
                 continue
-                
+
             if 'NAMESPACE' in line and 'GPU0(Allocated)' in line:
                 reading_pod_section = True
                 continue
-                
+
             if any(line.startswith(x) for x in ['IPADDRESS:', 'Allocated :', 'Total :', 'Allocated/Total']):
                 reading_pod_section = False
                 continue
-                
+
             if reading_pod_section and line:
                 parts = line.split()
                 if len(parts) >= 2 and not line.startswith(('NAME:', 'IPADDRESS:', 'Allocated :', 'Total :')):
                     pod_name = parts[0]
                     namespace = parts[1]
                     base_name = re.sub(r'-\d+$', '', pod_name)
-                    
+
                     # Skip excluded namespaces early
                     if namespace in self.config.get("excluded_namespaces", []):
                         logger.debug(f"Skipping pod in excluded namespace: {namespace}/{pod_name}")
                         continue
-                    
+
+                    # Update configuration for new namespace/pod
+                    self.update_config_for_pod(namespace, base_name)
+
                     pod_info = {
                         'name': base_name,
                         'namespace': namespace,
@@ -132,16 +178,16 @@ class K8sResourceManager:
     def get_pod_creation_time(self, namespace: str, pod_name: str) -> Optional[datetime]:
         """Get pod creation timestamp with caching"""
         cache_key = f"{namespace}/{pod_name}"
-        
+
         if cache_key in self.creation_time_cache:
             cached_time, timestamp = self.creation_time_cache[cache_key]
             if time.time() - timestamp < self.cache_expiry:
                 return cached_time
 
-        cmd = ['kubectl', 'get', 'pod', pod_name, '-n', namespace, 
+        cmd = ['kubectl', 'get', 'pod', pod_name, '-n', namespace,
                '-o', 'jsonpath={.metadata.creationTimestamp}']
         output = self.execute_command(cmd)
-        
+
         if output:
             try:
                 creation_time = datetime.strptime(
@@ -165,17 +211,17 @@ class K8sResourceManager:
 
             value = float(match.group(1))
             unit = match.group(2)
-            
+
             current_time = datetime.now(timezone.utc)
             age = current_time - creation_time
             age_hours = age.total_seconds() / 3600
-            
+
             if unit == 'h':
                 return age_hours > value
             elif unit == 'd':
                 return age_hours > (value * 24)
             return False
-            
+
         except Exception as e:
             logger.error(f"Error checking termination: {e}")
             return False
@@ -205,7 +251,7 @@ class K8sResourceManager:
             namespace = pod['namespace']
             name = pod['name']
             full_name = pod['full_name']
-            
+
             # Get termination window from config
             namespace_config = self.config["namespaces"].get(namespace, {})
             pod_config = namespace_config.get("pods", {}).get(name, {})
@@ -214,13 +260,13 @@ class K8sResourceManager:
                 namespace_config.get("termination_window") or
                 self.config.get("default_termination_window", "2h")
             )
-            
+
             creation_time = self.get_pod_creation_time(namespace, full_name)
             if creation_time:
                 age = datetime.now(timezone.utc) - creation_time
                 age_hours = age.total_seconds() / 3600
                 logger.info(f"Pod {full_name} in {namespace} age: {age_hours:.1f}h, window: {termination_window}")
-                
+
                 if self.should_terminate_pod(creation_time, termination_window):
                     logger.info(f"Pod {full_name} exceeded window of {termination_window}")
                     if self.terminate_pod(namespace, name, full_name):
@@ -234,24 +280,24 @@ class K8sResourceManager:
         """Main loop"""
         logger.info("Starting Kubernetes Resource Manager")
         logger.info(f"Excluded namespaces: {', '.join(self.config.get('excluded_namespaces', []))}")
-        
+
         while True:
             try:
                 logger.info("Starting new check cycle...")
-                
+
                 # Reload config at start of each cycle
                 self.config = self.load_config()
-                
+
                 pods = self.parse_gpushare_output()
                 if pods:
                     logger.info("Processing pods...")
                     self.process_pods(pods)
                 else:
                     logger.info("No pods found in non-excluded namespaces")
-                
+
                 logger.info(f"Sleeping for {interval} seconds...")
                 time.sleep(interval)
-                
+
             except KeyboardInterrupt:
                 logger.info("Shutting down gracefully...")
                 break
