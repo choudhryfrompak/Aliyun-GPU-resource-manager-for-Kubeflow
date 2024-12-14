@@ -39,7 +39,6 @@ class K8sResourceManager:
         """Update configuration with new namespace and pod if not present"""
         config_modified = False
 
-        # Add namespace if it doesn't exist and isn't excluded
         if (namespace not in self.config.get("namespaces", {}) and 
             namespace not in self.config.get("excluded_namespaces", [])):
             if "namespaces" not in self.config:
@@ -51,7 +50,6 @@ class K8sResourceManager:
             logger.info(f"Added new namespace to config: {namespace}")
             config_modified = True
 
-        # Add pod if it doesn't exist in the namespace
         if namespace in self.config.get("namespaces", {}):
             namespace_config = self.config["namespaces"][namespace]
             if "pods" not in namespace_config:
@@ -65,7 +63,6 @@ class K8sResourceManager:
                 logger.info(f"Added new pod to config: {namespace}/{pod_name}")
                 config_modified = True
 
-        # Save config if modified
         if config_modified:
             self.save_config()
 
@@ -155,12 +152,10 @@ class K8sResourceManager:
                     namespace = parts[1]
                     base_name = re.sub(r'-\d+$', '', pod_name)
 
-                    # Skip excluded namespaces early
                     if namespace in self.config.get("excluded_namespaces", []):
                         logger.debug(f"Skipping pod in excluded namespace: {namespace}/{pod_name}")
                         continue
 
-                    # Update configuration for new namespace/pod
                     self.update_config_for_pod(namespace, base_name)
 
                     pod_info = {
@@ -227,22 +222,34 @@ class K8sResourceManager:
             return False
 
     def terminate_pod(self, namespace: str, name: str, full_name: str) -> bool:
-        """Terminate a pod using kubectl"""
+        """Terminate a notebook using the annotation method"""
         try:
-            logger.info(f"Terminating pod {full_name} in namespace {namespace}")
-            # Try notebook deletion first
-            result = self.execute_command(
-                ['kubectl', 'delete', 'notebook', '-n', namespace, name]
-            )
-            if result is None:
-                # If notebook deletion fails, try pod deletion
-                logger.info("Notebook deletion failed, trying pod deletion...")
-                result = self.execute_command(
-                    ['kubectl', 'delete', 'pod', '-n', namespace, full_name]
-                )
-            return result is not None
+            # Parse the base notebook name (remove -0 suffix)
+            base_notebook_name = name.split('-')[0]
+            
+            logger.info(f"Terminating notebook {base_notebook_name} in namespace {namespace}")
+            
+            # Get current timestamp in UTC
+            current_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            
+            # Stop the notebook using annotation with the base name
+            result = self.execute_command([
+                'kubectl', 'annotate', 'notebook', 
+                base_notebook_name,
+                f'kubeflow-resource-stopped={current_time}',
+                '-n', namespace,
+                '--overwrite'
+            ])
+            
+            if result is not None:
+                logger.info(f"Successfully stopped notebook {base_notebook_name}")
+                return True
+            else:
+                logger.error(f"Failed to stop notebook {base_notebook_name}")
+                return False
+                
         except Exception as e:
-            logger.error(f"Error terminating pod: {e}")
+            logger.error(f"Error terminating notebook: {e}")
             return False
 
     def process_pods(self, pods: List[dict]) -> None:
@@ -252,7 +259,6 @@ class K8sResourceManager:
             name = pod['name']
             full_name = pod['full_name']
 
-            # Get termination window from config
             namespace_config = self.config["namespaces"].get(namespace, {})
             pod_config = namespace_config.get("pods", {}).get(name, {})
             termination_window = (
@@ -285,7 +291,6 @@ class K8sResourceManager:
             try:
                 logger.info("Starting new check cycle...")
 
-                # Reload config at start of each cycle
                 self.config = self.load_config()
 
                 pods = self.parse_gpushare_output()
