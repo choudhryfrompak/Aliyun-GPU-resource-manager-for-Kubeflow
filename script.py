@@ -2,11 +2,15 @@
 import json
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 import re
 import logging
 import os
 from typing import Dict, List, Optional
+import pytz  # For timezone handling
+
+# Get local timezone
+local_tz = pytz.timezone('Asia/Karachi')  # Pakistan timezone
 
 # Setup logging
 logging.basicConfig(
@@ -26,52 +30,37 @@ class K8sResourceManager:
         self.cache_expiry = 300
         self.config = self.load_config()
 
+    def get_local_time(self) -> str:
+        """Get current time in local timezone"""
+        return datetime.now(local_tz).isoformat()
+
+    def format_duration(self, hours: float) -> str:
+        """Format duration in hours to human readable string"""
+        if hours < 1:
+            minutes = int(hours * 60)
+            return f"{minutes} minutes"
+        elif hours < 24:
+            return f"{hours:.1f} hours"
+        else:
+            days = hours / 24
+            return f"{days:.1f} days"
+
     def save_config(self) -> None:
         """Save current configuration to JSON file"""
         try:
             with open(self.config_file, 'w') as f:
                 json.dump(self.config, f, indent=2)
-            logger.info("Configuration saved successfully")
+            logger.debug("Configuration saved successfully")
         except Exception as e:
             logger.error(f"Error saving config file: {str(e)}")
-
-    def update_config_for_pod(self, namespace: str, pod_name: str) -> None:
-        """Update configuration with new namespace and pod if not present"""
-        config_modified = False
-
-        if (namespace not in self.config.get("namespaces", {}) and 
-            namespace not in self.config.get("excluded_namespaces", [])):
-            if "namespaces" not in self.config:
-                self.config["namespaces"] = {}
-            self.config["namespaces"][namespace] = {
-                "termination_window": self.config.get("default_termination_window", "2h"),
-                "pods": {}
-            }
-            logger.info(f"Added new namespace to config: {namespace}")
-            config_modified = True
-
-        if namespace in self.config.get("namespaces", {}):
-            namespace_config = self.config["namespaces"][namespace]
-            if "pods" not in namespace_config:
-                namespace_config["pods"] = {}
-            
-            if pod_name not in namespace_config["pods"]:
-                namespace_config["pods"][pod_name] = {
-                    "termination_window": namespace_config.get("termination_window", 
-                                        self.config.get("default_termination_window", "2h"))
-                }
-                logger.info(f"Added new pod to config: {namespace}/{pod_name}")
-                config_modified = True
-
-        if config_modified:
-            self.save_config()
 
     def load_config(self) -> dict:
         """Load configuration from JSON file with error handling"""
         default_config = {
             "excluded_namespaces": ["kube-system", "kubeflow"],
             "default_termination_window": "2h",
-            "namespaces": {}
+            "namespaces": {},
+            "pod_timestamps": {}
         }
 
         try:
@@ -82,9 +71,18 @@ class K8sResourceManager:
                 return default_config
 
             with open(self.config_file, 'r') as f:
+                content = f.read().strip()
+                if not content:
+                    with open(self.config_file, 'w') as f:
+                        json.dump(default_config, f, indent=2)
+                    return default_config
+                    
                 try:
-                    config = json.load(f)
-                    logger.info("Successfully loaded config file")
+                    config = json.loads(content)
+                    if "pod_timestamps" not in config:
+                        config["pod_timestamps"] = {}
+                    if "namespaces" not in config:
+                        config["namespaces"] = {}
                     return config
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid JSON in config file: {str(e)}")
@@ -95,6 +93,27 @@ class K8sResourceManager:
             logger.error(f"Error handling config file: {str(e)}")
             logger.info("Using default configuration")
             return default_config
+
+    def update_pod_timestamp(self, namespace: str, pod_name: str) -> None:
+        """Update pod's last seen running timestamp only if new or previously stopped"""
+        if "pod_timestamps" not in self.config:
+            self.config["pod_timestamps"] = {}
+            
+        if namespace not in self.config["pod_timestamps"]:
+            self.config["pod_timestamps"][namespace] = {}
+            
+        current_time = self.get_local_time()
+        
+        # Update timestamp only if:
+        # 1. Pod is not in our records
+        # 2. Pod was previously stopped
+        pod_info = self.config["pod_timestamps"][namespace].get(pod_name, {})
+        if not pod_info or "last_stopped" in pod_info:
+            self.config["pod_timestamps"][namespace][pod_name] = {
+                "last_seen_running": current_time
+            }
+            logger.info(f"Updated start time for pod {pod_name} in namespace {namespace}")
+            self.save_config()
 
     def execute_command(self, command: List[str]) -> Optional[str]:
         """Execute command with timeout"""
@@ -150,89 +169,101 @@ class K8sResourceManager:
                 if len(parts) >= 2 and not line.startswith(('NAME:', 'IPADDRESS:', 'Allocated :', 'Total :')):
                     pod_name = parts[0]
                     namespace = parts[1]
-                    base_name = re.sub(r'-\d+$', '', pod_name)
 
                     if namespace in self.config.get("excluded_namespaces", []):
                         logger.debug(f"Skipping pod in excluded namespace: {namespace}/{pod_name}")
                         continue
 
-                    self.update_config_for_pod(namespace, base_name)
+                    # Update timestamp when we see a running pod
+                    self.update_pod_timestamp(namespace, pod_name)
 
                     pod_info = {
-                        'name': base_name,
+                        'name': pod_name,
                         'namespace': namespace,
                         'node': current_node,
                         'full_name': pod_name
                     }
                     pods.append(pod_info)
+                    logger.info(f"\nFound pod: {pod_name}")
+                    logger.info(f"  Namespace: {namespace}")
+                    logger.info(f"  Node: {current_node}")
 
         found_pods = len(pods)
-        logger.info(f"Found {found_pods} pods in non-excluded namespaces")
+        logger.info(f"\nTotal pods found: {found_pods}")
         return pods
 
-    def get_pod_creation_time(self, namespace: str, pod_name: str) -> Optional[datetime]:
-        """Get pod creation timestamp with caching"""
-        cache_key = f"{namespace}/{pod_name}"
+    def parse_notebook_name(self, name: str) -> str:
+        """Parse notebook name by removing numerical suffixes while preserving alphabetical parts."""
+        parts = name.split('-')
+        result_parts = []
+        
+        for i, part in enumerate(parts):
+            if part.isdigit():
+                remaining_parts = parts[i+1:]
+                if all(p.isdigit() or not p for p in remaining_parts):
+                    break
+            result_parts.append(part)
+        
+        return '-'.join(result_parts)
 
-        if cache_key in self.creation_time_cache:
-            cached_time, timestamp = self.creation_time_cache[cache_key]
-            if time.time() - timestamp < self.cache_expiry:
-                return cached_time
-
-        cmd = ['kubectl', 'get', 'pod', pod_name, '-n', namespace,
-               '-o', 'jsonpath={.metadata.creationTimestamp}']
-        output = self.execute_command(cmd)
-
-        if output:
-            try:
-                creation_time = datetime.strptime(
-                    output.strip(), '%Y-%m-%dT%H:%M:%SZ'
-                ).replace(tzinfo=timezone.utc)
-                self.creation_time_cache[cache_key] = (creation_time, time.time())
-                return creation_time
-            except ValueError as e:
-                logger.error(f"Error parsing creation time: {e}")
-        return None
-
-    def should_terminate_pod(self, creation_time: datetime, termination_window: str) -> bool:
-        """Check if pod should be terminated based on its age"""
-        if not creation_time:
-            return False
-
+    def calculate_pod_age(self, start_time_str: str) -> float:
+        """Calculate pod age in hours"""
         try:
+            start_time = datetime.fromisoformat(start_time_str)
+            current_time = datetime.now(local_tz)
+            age = current_time - start_time.astimezone(local_tz)
+            return age.total_seconds() / 3600
+        except Exception as e:
+            logger.error(f"Error calculating pod age: {e}")
+            return 0
+
+    def should_terminate_pod(self, namespace: str, pod_name: str, termination_window: str) -> tuple[bool, float]:
+        """Check if pod should be terminated and return remaining time"""
+        try:
+            if namespace not in self.config["pod_timestamps"]:
+                return False, 0
+                
+            if pod_name not in self.config["pod_timestamps"][namespace]:
+                return False, 0
+                
+            pod_info = self.config["pod_timestamps"][namespace][pod_name]
+            if "last_seen_running" not in pod_info:
+                return False, 0
+
+            age_hours = self.calculate_pod_age(pod_info["last_seen_running"])
+            
             match = re.match(r'(\d*\.?\d+)([hd])', termination_window)
             if not match:
-                return False
+                return False, 0
 
             value = float(match.group(1))
             unit = match.group(2)
 
-            current_time = datetime.now(timezone.utc)
-            age = current_time - creation_time
-            age_hours = age.total_seconds() / 3600
+            limit_hours = value if unit == 'h' else value * 24
+            remaining_hours = limit_hours - age_hours
 
-            if unit == 'h':
-                return age_hours > value
-            elif unit == 'd':
-                return age_hours > (value * 24)
-            return False
+            return age_hours > limit_hours, remaining_hours
 
         except Exception as e:
             logger.error(f"Error checking termination: {e}")
-            return False
+            return False, 0
 
     def terminate_pod(self, namespace: str, name: str, full_name: str) -> bool:
         """Terminate a notebook using the annotation method"""
         try:
-            # Parse the base notebook name (remove -0 suffix)
-            base_notebook_name = name.split('-')[0]
+            base_notebook_name = self.parse_notebook_name(name)
             
-            logger.info(f"Terminating notebook {base_notebook_name} in namespace {namespace}")
+            logger.info(f"\nTerminating notebook:")
+            logger.info(f"  Original name: {name}")
+            logger.info(f"  Base name: {base_notebook_name}")
+            logger.info(f"  Namespace: {namespace}")
             
-            # Get current timestamp in UTC
-            current_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            current_time = self.get_local_time()
             
-            # Stop the notebook using annotation with the base name
+            if namespace in self.config["pod_timestamps"] and name in self.config["pod_timestamps"][namespace]:
+                self.config["pod_timestamps"][namespace][name]["last_stopped"] = current_time
+                self.save_config()
+            
             result = self.execute_command([
                 'kubectl', 'annotate', 'notebook', 
                 base_notebook_name,
@@ -259,38 +290,41 @@ class K8sResourceManager:
             name = pod['name']
             full_name = pod['full_name']
 
-            namespace_config = self.config["namespaces"].get(namespace, {})
-            pod_config = namespace_config.get("pods", {}).get(name, {})
-            termination_window = (
-                pod_config.get("termination_window") or
-                namespace_config.get("termination_window") or
-                self.config.get("default_termination_window", "2h")
-            )
+            termination_window = self.config.get("default_termination_window", "2h")
+            should_terminate, remaining_hours = self.should_terminate_pod(namespace, name, termination_window)
 
-            creation_time = self.get_pod_creation_time(namespace, full_name)
-            if creation_time:
-                age = datetime.now(timezone.utc) - creation_time
-                age_hours = age.total_seconds() / 3600
-                logger.info(f"Pod {full_name} in {namespace} age: {age_hours:.1f}h, window: {termination_window}")
+            # Get pod age
+            pod_info = self.config["pod_timestamps"][namespace].get(name, {})
+            if "last_seen_running" in pod_info:
+                age_hours = self.calculate_pod_age(pod_info["last_seen_running"])
+                
+                logger.info(f"\nPod Status: {name}")
+                logger.info(f"  Namespace: {namespace}")
+                logger.info(f"  Age: {self.format_duration(age_hours)}")
+                logger.info(f"  Termination Window: {termination_window}")
+                
+                if remaining_hours > 0:
+                    logger.info(f"  Time until termination: {self.format_duration(remaining_hours)}")
+                else:
+                    logger.info(f"  Exceeded termination window by: {self.format_duration(-remaining_hours)}")
 
-                if self.should_terminate_pod(creation_time, termination_window):
-                    logger.info(f"Pod {full_name} exceeded window of {termination_window}")
-                    if self.terminate_pod(namespace, name, full_name):
-                        logger.info(f"Successfully terminated pod {full_name}")
-                    else:
-                        logger.error(f"Failed to terminate pod {full_name}")
-            else:
-                logger.warning(f"Could not get creation time for pod {full_name}")
+            if should_terminate:
+                logger.info(f"\nPod {full_name} exceeded window of {termination_window}")
+                if self.terminate_pod(namespace, name, full_name):
+                    logger.info(f"Successfully terminated pod {full_name}")
+                else:
+                    logger.error(f"Failed to terminate pod {full_name}")
 
-    def run(self, interval: int = 60):
+    def run(self, interval: int = 3):  # Changed default interval to 3 seconds
         """Main loop"""
         logger.info("Starting Kubernetes Resource Manager")
         logger.info(f"Excluded namespaces: {', '.join(self.config.get('excluded_namespaces', []))}")
 
         while True:
             try:
-                logger.info("Starting new check cycle...")
+                logger.info("\nStarting new check cycle...")
 
+                # Reload config at start of each cycle
                 self.config = self.load_config()
 
                 pods = self.parse_gpushare_output()
