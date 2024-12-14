@@ -1,13 +1,1 @@
-{
-  "excluded_namespaces": [
-    "kube-system",
-    "kubeflow"
-  ],
-  "default_termination_window": "2h",
-  "namespaces": {
-    "kubeflow-admin": {
-      "termination_window": "2h",
-      "pods": {}
-    }
-  }
-}
+
